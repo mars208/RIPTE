@@ -1,0 +1,811 @@
+#!/usr/bin/env python
+#
+# ARMv7 bare metal binary instrumentation tool
+#
+# Copyright (c) 2016 Aalto University
+#
+import argparse
+import binascii
+import ConfigParser
+import logging
+import math
+import mmap
+import os.path
+import struct
+import sys
+import time 
+from argparse import Namespace
+from bitarray import bitarray
+from capstone.arm import *
+from capstone import *
+from enum import Enum
+from datetime import datetime
+import time
+
+from Crypto.Cipher import AES, ARC4
+from binascii import b2a_hex, a2b_hex
+from pyblake2 import *
+from hashlib import sha256
+from Crypto.Hash import SHA
+from Crypto import Random
+
+CONFIG_DEFAULT_PATHNAME = '../hookit.cfg'
+CONFIG_SECTION_CODE_ADDRESSES = 'code-addresses'
+CONFIG_SECTION_HOOK_ADDRESSES = 'hook-addresses'
+
+DEFAULT_BTBL_PATHNAME = 'btbl.c'
+DEFAULT_LTBL_PATHNAME = 'ltbl.c'
+DEFAULT_FTBL_PATHNAME = 'ftbl.c'
+DEFAULT_FDTBL_PATHNAME = 'fdtbl.c'
+
+CONFIG_DEFAULTS = {
+        'load_address'   : '0x0000',
+        'text_start'     : None,
+        'text_end'       : None,
+        'omit_addresses' : None,
+        'hook_b'         : None,
+        'hook_bl'        : None,
+        'hook_bx_lr'     : None,
+        'hook_pop_fp_pc' : None,
+        'hook_pop_fp_lr' : None,
+        'hook_blx'     : None,
+}
+
+class CFS(Enum):
+    b         = 1
+    bl        = 2
+    bx_lr     = 3
+    pop_fp_pc = 4
+    pop_fp_lr = 5
+    blx       = 6
+
+def new_cfs(cfs_type, cfs_instr, cfs_src, cfs_dst):
+    return Namespace(
+            type = cfs_type,
+            instr = cfs_instr,
+            src  = cfs_src,
+            dst  = cfs_dst,
+    )
+
+def new_cfs_with_lr(cfs_type, cfs_instr, cfs_src, cfs_dst, cfs_lr, cfs_rt_type):
+    return Namespace(
+            type = cfs_type,
+            instr = cfs_instr,
+            src  = cfs_src,
+            dst  = cfs_dst,
+            lr_value = cfs_lr,
+            rt_type = cfs_rt_type
+    )
+
+def new_function(func_start, func_end, func_measurement, rt_type):
+    return Namespace(
+            start = func_start,
+            end = func_end,
+            measurement  = func_measurement, 
+            rt_type= rt_type
+    )
+
+def read_config(pathname):
+    parser = ConfigParser.SafeConfigParser(CONFIG_DEFAULTS)
+    parser.read(pathname)
+
+    return Namespace(
+            load_address   = parser.get(CONFIG_SECTION_CODE_ADDRESSES, 'load_address'),
+            text_start     = parser.get(CONFIG_SECTION_CODE_ADDRESSES, 'text_start'),
+            text_end       = parser.get(CONFIG_SECTION_CODE_ADDRESSES, 'text_end'),
+            omit_addresses = parser.get(CONFIG_SECTION_CODE_ADDRESSES, 'omit_addresses'),
+            hook_b         = parser.get(CONFIG_SECTION_HOOK_ADDRESSES, 'hook_b'),
+            hook_bl        = parser.get(CONFIG_SECTION_HOOK_ADDRESSES, 'hook_bl'),
+            hook_bx_lr     = parser.get(CONFIG_SECTION_HOOK_ADDRESSES, 'hook_bx_lr'),
+            # hook_pop_r4_r5_fp_pc = parser.get(CONFIG_SECTION_HOOK_ADDRESSES, 'hook_pop_r4_r5_fp_pc'),
+            # hook_pop_r4_fp_pc = parser.get(CONFIG_SECTION_HOOK_ADDRESSES, 'hook_pop_r4_fp_pc'),
+            # hook_pop_r4_r5_r6_fp_pc = parser.get(CONFIG_SECTION_HOOK_ADDRESSES, 'hook_pop_r4_r5_r6_fp_pc'),
+            hook_pop_fp_pc = parser.get(CONFIG_SECTION_HOOK_ADDRESSES, 'hook_pop_fp_pc'),
+            hook_pop_fp_lr = parser.get(CONFIG_SECTION_HOOK_ADDRESSES, 'hook_pop_fp_lr'),
+            hook_blx       = parser.get(CONFIG_SECTION_HOOK_ADDRESSES, 'hook_blx'),
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description='ARMv7 Branch Target Rewriting Tool')
+    parser.add_argument('file', nargs='?', metavar='FILE', default="sample",
+            help='binary file to instrument')
+    parser.add_argument('-L', '--load-address', dest='load_address', default=None,
+            help='load address of binary image')
+    parser.add_argument('--text-start', dest='text_start', default=None,
+            help='start address of section to instrument')
+    parser.add_argument('--text-end', dest='text_end', default=None,
+            help='end address of section to instrument')
+    parser.add_argument('--omit-addresses', dest='omit_addresses', default=None,
+            help='comma separated list of addresses of instructions to omit from instrumentation')
+    parser.add_argument('-l', '--little-endian', dest='flags', default=[],
+            action='append_const', const=CS_MODE_LITTLE_ENDIAN,
+            help='disassemble in little endian mode')
+    parser.add_argument('-b', '--big-endian', dest='flags', default=[],
+            action='append_const', const=CS_MODE_BIG_ENDIAN,
+            help='disassemble in big endian mode')
+    parser.add_argument('-o', '--outfile', dest='outfile',
+            help='outfile for branch table')
+    parser.add_argument('-c', '--config', dest='config',
+            help='pathname of configuration file')
+    parser.add_argument('--dry-run', '-n', dest='dry_run', action='store_true',
+            help='perform a dry run (do not modify binary)')
+    parser.add_argument('--verbose', '-v', action='count', default=3,
+            help='verbose output (repeat up to three times for additional information)')
+    parser.add_argument('--print-cfs-table', dest='print_cfs_table', action='store_true',
+            help='print control flow statement table')
+    parser.add_argument('--print-branch-table', dest='print_branch_table', action='store_true',
+            help='')
+    parser.add_argument('--print-loop-table', dest='print_loop_table', action='store_true',
+            help='')
+    parser.add_argument('--create-branch-table', dest='gen_branch_table', action='store_true',
+            help='')
+    parser.add_argument('--create-loop-table', dest='gen_loop_table', action='store_true',
+            help='')
+
+
+    args = parser.parse_args()
+    #args.flags.append(CS_MODE_BIG_ENDIAN)
+
+    if args.verbose is None:
+        logging.basicConfig(format='%(message)s',level=logging.ERROR,filename='myapp.log',
+                filemode='w')
+    if args.verbose is 1:
+        logging.basicConfig(format='%(message)s',level=logging.WARNING,filename='myapp.log',
+                filemode='w')
+    if args.verbose is 2:
+        logging.basicConfig(format='%(message)s',level=logging.INFO,filename='myapp.log',
+                filemode='w')
+    if args.verbose >= 3:
+        logging.basicConfig(format='%(message)s',level=logging.DEBUG,filename='myapp.log',
+                filemode='w')
+
+    try:
+        config = read_config(args.config if args.config is not None
+                else CONFIG_DEFAULT_PATHNAME)
+    except ConfigParser.MissingSectionHeaderError as error:
+            logging.error(error)
+            sys.exit(1)
+
+    def get_req_opt(opt):
+        args_value =  getattr(args, opt) if hasattr(args, opt) else None
+        config_value = getattr(config, opt) if hasattr(config, opt) else None
+
+        if args_value is not None:
+            return args_value
+        elif config_value is not None:
+            return config_value
+        else:
+            exit("%s: required option '%s' not defined" % (sys.argv[0], opt));
+
+    def get_csv_opt(opt):
+        args_value =  getattr(args, opt) if hasattr(args, opt) else None
+        config_value = getattr(config, opt) if hasattr(config, opt) else None
+
+        if args_value is not None:
+            return args_value.split(',')
+        elif config_value is not None:
+            return config_value.split(',')
+        else:
+            return []
+
+    opts = Namespace(
+            binfile        = args.file,
+            outfile        = args.outfile,
+            dry_run        = args.dry_run,
+            cs_mode_flags  = args.flags,
+            load_address   = int(get_req_opt('load_address'),   16),
+            text_start     = int(get_req_opt('text_start'),     16),
+            text_end       = int(get_req_opt('text_end'),       16),
+            omit_addresses = [int(i,16) for i in get_csv_opt('omit_addresses')],
+            hook_b         = int(get_req_opt('hook_b'),         16),
+            hook_bl        = int(get_req_opt('hook_bl'),        16),
+            hook_bx_lr     = int(get_req_opt('hook_bx_lr'),     16),
+            # hook_pop_r4_r5_fp_pc = int(get_req_opt('hook_pop_r4_r5_fp_pc'), 16),
+            # hook_pop_r4_fp_pc  = int(get_req_opt('hook_pop_r4_fp_pc'), 16),
+            # hook_pop_r4_r5_r6_fp_pc  = int(get_req_opt('hook_pop_r4_r5_r6_fp_pc'), 16),
+            hook_pop_fp_pc = int(get_req_opt('hook_pop_fp_pc'), 16),
+            hook_pop_fp_lr = int(get_req_opt('hook_pop_fp_lr'), 16),
+            hook_blx    = int(get_req_opt('hook_blx'),    16),
+            print_cfs_table = args.print_cfs_table,
+            print_branch_table = args.print_branch_table,
+            print_loop_table = args.print_loop_table,
+            gen_branch_table = args.gen_branch_table,
+            gen_loop_table = args.gen_loop_table,
+    )
+
+    logging.debug("load_address         = 0x%08x" % opts.load_address)
+    logging.debug("text_start           = 0x%08x" % opts.text_start)
+    logging.debug("text_end             = 0x%08x" % opts.text_end)
+    logging.debug("omit_addresses       = %s" % ['0x%08x' % i for i in opts.omit_addresses])
+    logging.debug("hook_b               = 0x%08x" % opts.hook_b)
+    logging.debug("hook_bl              = 0x%08x" % opts.hook_bl)
+    logging.debug("hook_bx_lr           = 0x%08x" % opts.hook_bx_lr)
+    logging.debug("hook_pop_fp_lr       = 0x%08x" % opts.hook_pop_fp_pc)
+    logging.debug("hook_blx          = 0x%08x" % opts.hook_blx)
+
+    if not os.path.isfile(args.file):
+        exit("%s: file '%s' not found" % (sys.argv[0], args.file));
+
+    [control_flow_statements, function_table] = hookit(opts)
+
+    if opts.print_cfs_table:
+        print "cfs table:"
+        for cfs in control_flow_statements:
+            print "%s,0x%08x,0x%08x" % (hexbytes(cfs.instr), cfs.src, cfs.dst)
+
+    if opts.print_branch_table:
+        print "branch table:"
+        for cfs in get_branches(control_flow_statements):
+            print "0x%08x,0x%08x" % (cfs.src, cfs.dst)
+
+    if opts.print_loop_table:
+        print "loop table:"
+        for (entry, exit) in get_loops(control_flow_statements):
+            print "0x%08x,0x%08x" % (entry, exit)
+
+    print "function table:"
+    for cfs in get_function_call(control_flow_statements):
+        print "0x%08x,0x%08x, 0x%s" % (cfs.src, cfs.dst, cfs.lr_value)    
+
+    if opts.gen_branch_table:
+        write_branch_table(opts.outfile if opts.outfile != None else DEFAULT_BTBL_PATHNAME,
+                get_branches(control_flow_statements))
+
+    if opts.gen_loop_table:
+        write_loop_table(opts.outfile if opts.outfile != None else DEFAULT_LTBL_PATHNAME,
+                get_loops(control_flow_statements))
+
+    write_function_call_table(opts.outfile if opts.outfile != None else DEFAULT_FTBL_PATHNAME,
+            get_function_call(control_flow_statements))
+
+    write_function_table(opts.outfile if opts.outfile != None else DEFAULT_FDTBL_PATHNAME,
+            function_table)
+
+def get_branches(control_flow_statements):
+     return [c for c in control_flow_statements if c.type == CFS.b or c.type == CFS.bl]
+
+def get_loops(control_flow_statements):
+    branches = [c for c in control_flow_statements if (c.type == CFS.b and c.dst < c.src)]
+    # loop_entries = set([c.dst for c in branches])
+    # loops = [(entry, 4 + max([b.src for b in branches if b.dst == entry])) for entry in loop_entries]
+    loop_ends = set([c.src for c in branches])
+    # loops = [(entry, 4 + max([b.src for b in branches if b.dst == entry])) for entry in loop_entries]
+    loops = [(max([b.dst for b in branches if b.src == end]), 4 + end) for end in loop_ends]
+    return sorted(loops, key=lambda x: x[0])
+
+def get_function_call(control_flow_statements):
+     return [c for c in control_flow_statements if c.type == CFS.bl or c.type == CFS.blx]
+
+def hookit(opts):
+    control_flow_statements = []
+    function_table = []
+
+    md = Cs(CS_ARCH_ARM, CS_MODE_ARM + sum(opts.cs_mode_flags))
+    md.detail = True;
+
+    with open(opts.binfile, "rw+b") as f:
+        mm = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ|mmap.PROT_WRITE)
+
+        offset = opts.text_start - opts.load_address
+        logging.debug("hooking %s from 0x%08x to 0x%08x" % (opts.binfile, offset, opts.text_end - opts.load_address))
+        mm.seek(offset)
+        code = mm.read(mm.size() - mm.tell())
+
+        current_address = opts.load_address + (offset)
+        lastAddress = current_address
+
+        prev_address = -0x0001
+
+        while True:
+            for i in md.disasm(code, current_address):
+                #print(binascii.hexlify(i.bytes))
+                # Workaround for md.disasm returning dublicate instructions
+                if i.address == prev_address:
+                    continue
+                else:
+                    prev_address = i.address
+
+                if (i.address in opts.omit_addresses):
+                    logging.info("omit  at 0x%08x:         %-10s\t%s\t%s" %
+                            (i.address, hexbytes(i.bytes), i.mnemonic, i.op_str))
+
+                    if i.address >= opts.text_end:
+                        break
+
+                    continue
+
+                # branch w/ link instruction; bl <pc relative offset>
+                if (i.id == ARM_INS_BL):
+                    rewrite_branch_with_link(mm, control_flow_statements, opts.load_address, i, opts.hook_bl, opts.dry_run)
+
+                # branch and exchange where operand is link register; bx lr
+                elif (i.id == ARM_INS_BX and len(i.operands) == 1 and i.operands[0].reg == ARM_REG_LR):
+                    rewrite_branch_and_exchange_lr(mm, control_flow_statements, opts.load_address, i, opts.hook_bx_lr, md, code, lastAddress, function_table, opts.dry_run)
+                    lastAddress = i.address + 4
+
+                elif (i.id == ARM_INS_POP and i.operands[len(i.operands)-1].reg == ARM_REG_PC):
+                    rewrite_pop_fp_pc(mm, control_flow_statements, opts.load_address, i, opts.hook_pop_fp_pc, md, code, lastAddress, function_table, opts.dry_run)
+                    lastAddress = i.address + 4
+
+                # pop frame pointer and return address to link register off stack; pop {fp, lr}
+                elif (i.id == ARM_INS_POP and len(i.operands) == 2
+                        and i.operands[0].reg == ARM_REG_FP
+                        and i.operands[1].reg == ARM_REG_LR):
+                    rewrite_pop_fp_lr(mm, control_flow_statements, opts.load_address, i, opts.hook_pop_fp_lr, opts.dry_run)
+
+                elif (i.id == ARM_INS_BLX and len(i.operands) == 1):
+                    rewrite_blx_rx(mm, control_flow_statements, opts.load_address, i, opts.hook_blx, opts.dry_run)
+
+                # check for currently unhandled instructions
+                elif (i.id == ARM_INS_BX):
+                    logging.warn("bx    at 0x%08x: %-10s\t%s\t%s" %
+                            (i.address, hexbytes(i.bytes), i.mnemonic, i.op_str))
+
+                else:
+                    logging.debug("      0x%08x: %-10s\t%s\t%s" %
+                            (i.address, hexbytes(i.bytes), i.mnemonic, i.op_str))
+
+                if i.address >= opts.text_end:
+                    break
+
+
+
+            current_address = (i.address if i.address > current_address
+                                       else current_address + 4)
+            # current_address = (i.address if i.address > current_address
+            #                    else current_address + 2)
+
+            if (current_address >= opts.text_end or
+                current_address >= opts.load_address + mm.size()):
+                break
+
+            mm.seek(current_address - opts.load_address)
+            code = mm.read(mm.size() - mm.tell()) 
+
+        for cfs in control_flow_statements:
+            if cfs.type == CFS.bl:
+                measurement = 0
+                rt_type = 200
+                mark = 0
+                key = bytes('1234567890123456')
+                for func in function_table:
+                    # logging.debug(hex(func.start))
+                    if mark == 1:
+                        rt_type = func.rt_type
+                        break
+                    if func.start <= cfs.dst and func.end >= cfs.dst:
+                        if func.start < cfs.dst:
+                            func.start = cfs.dst
+                            start_address = func.start
+                            end_address = func.end
+                            # h = blake2s(digest_size = 4)
+                            h = sha256()
+                            current_address = start_address
+                            mm.seek(current_address - opts.load_address)
+                            code = mm.read(mm.size() - mm.tell())
+                            for i in md.disasm(code, current_address):
+                                if current_address >= end_address:
+                                    break
+                                h.update(i.bytes)
+                                logging.debug("  0x%08x: %-10s\t%s\t%s" % (i.address, hexbytes(i.bytes), i.mnemonic, i.op_str))
+                                current_address = current_address + 4
+                            tmp_measurement = h.digest() 
+                            # print measurement
+                            logging.debug("%x, %x", func.start, func.end)
+                            logging.debug(binascii.hexlify(tmp_measurement)) 
+                            func.measurement = int(binascii.hexlify(tmp_measurement), 16)
+                        measurement = func.measurement
+                        if(func.rt_type == 150):
+                            mark = 1
+                            continue
+                        rt_type = func.rt_type
+                        break
+                logging.debug(hex(measurement))
+                key = 0x11223
+                enc_address = encrypt(measurement^(cfs.src + 4), key)
+                text = hex(measurement^(cfs.src + 4))[2:-1]
+                if len(text) < 64:
+                    text = '0' * (64 - len(text)) + text
+                # enc_address = encrypt_aes(text, key)
+                # enc_address = encrypt_rc4(text, key)
+                cfs.lr_value = binascii.hexlify(enc_address)
+                logging.debug(cfs.lr_value)
+                cfs.rt_type = rt_type
+
+    return [control_flow_statements, function_table]
+
+
+def rewrite_branch(mm, cfs_table, load_address, i, target, dry_run=False):
+    word = new_branch_with_link_instruction(i, target)
+
+    j = disasm_single(word, i.address)
+
+    logging.info("b     at 0x%08x: hooking %-10s\t%s\t%s -> %-10s\t%s\t%s" %
+            (i.address,
+                hexbytes(i.bytes), i.mnemonic, i.op_str,
+                hexbytes(j.bytes), j.mnemonic, j.op_str))
+
+    if  get_branch_target(i) < 0: return
+    cfs_table.append(new_cfs(CFS.b, i.bytes, i.address, get_branch_target(i)))
+
+    if dry_run: return
+    write_back(mm, i.address - load_address, word, CFS.b)
+
+##########################################################
+def encrypt(lr_address, key):
+    new_address = lr_address ^ key
+    return hex(new_address)[2:-1]
+
+def encrypt_rc4(text, key):
+    # nonce = Random.new().read(16)
+    # tempkey = SHA.new(key+nonce).digest()
+    cipher = ARC4.new(key)
+    result = cipher.encrypt(text)
+    # print binascii.hexlify(result)
+    return result
+
+# padding to multiple times of 16
+def encrypt_aes(text, key, mode = AES.MODE_ECB):
+    cryptor = AES.new(key,mode)
+
+    # key lengthe must be 16(AES-128), 24(AES-192) or 32(AES-256)
+    length = 16
+    count = len(text)
+    # print count
+    if count < length:
+        add = (length-count)
+        text = text + ('\0' * add)
+    elif count % length == 0:
+        pass
+    elif count > length:
+        add = (length-(count % length))
+        text = text + ('\0' * add)
+    ciphertext = cryptor.encrypt(text)
+    return ciphertext
+
+# use strip() to delete the left space
+def decrypt_aes(text, key, mode = AES.MODE_ECB):
+    cryptor = AES.new(key,mode)
+    plain_text  = cryptor.decrypt(a2b_hex(text))
+    return plain_text.rstrip('\0')
+
+def rewrite_branch_with_link(mm, cfs_table, load_address, i, target, dry_run=False):
+    word = new_branch_with_link_instruction(i, target)
+
+    j = disasm_single(word, i.address)
+
+    logging.info("bl    at 0x%08x: hooking %-10s\t%s\t%s -> %-10s\t%s\t%s" %
+            (i.address,
+                hexbytes(i.bytes), i.mnemonic, i.op_str,
+                hexbytes(j.bytes), j.mnemonic, j.op_str))
+
+    key = 0x11223
+    measurement = 0
+    enc_address = encrypt((i.address + 4)^measurement, key)
+
+    cfs_table.append(new_cfs_with_lr(CFS.bl, i.bytes, i.address, get_branch_target(i), enc_address, 200))
+
+    test_enc_address = encrypt_aes(hex(measurement^(i.address + 4))[2:-1], bytes('1234567890123456'))
+    if dry_run: return
+    write_back(mm, i.address - load_address, word, CFS.bl)
+############################################################
+
+def rewrite_branch_and_exchange_lr(mm, cfs_table, load_address, i, target, md, code, lastAddress, function_table, dry_run=False):
+    word = new_branch_with_link_instruction(i, target)
+
+    j = disasm_single(word, i.address)
+
+    logging.info("bx lr at 0x%08x: hooking %-10s\t%s\t%s      -> %-10s\t%s\t%s" %
+            (i.address,
+                hexbytes(i.bytes), i.mnemonic, i.op_str,
+                hexbytes(j.bytes), j.mnemonic, j.op_str))
+        
+    cfs_table.append(new_cfs(CFS.bx_lr, i.bytes, 0, 0))
+
+    start_address = lastAddress
+    end_address = i.address
+    # h = blake2s(digest_size = 4)
+    h = sha256()
+    current_address = start_address
+    mm.seek(start_address - load_address)
+    code = mm.read(mm.size() - mm.tell())
+    for ii in md.disasm(code, current_address):
+        if current_address >= end_address:
+            break
+        h.update(ii.bytes)
+        current_address = current_address + 4
+    measurement = h.digest() 
+    logging.debug(measurement) 
+    logging.debug(binascii.hexlify(measurement)) 
+    logging.debug(len(measurement)) 
+
+    if(i.op_str == 'bx'):
+        rt_type = 100
+    else:
+        rt_type = 150
+    
+    # enc_address = encrypt_aes(hex(measurement^(i.address + 4))[2:-1], key)
+    function_table.append(new_function(start_address, end_address, int(binascii.hexlify(measurement), 16), rt_type))
+
+    if dry_run: return
+    write_back(mm, i.address - load_address, word, CFS.blx)
+
+
+def rewrite_pop_fp_pc(mm, cfs_table, load_address, i, target, md, code, lastAddress, function_table, dry_run=False):
+    word = new_branch_with_link_instruction(i, target)
+
+    j = disasm_single(word, i.address)
+
+    logging.info("pop   at 0x%08x: hooking %-10s\t%s\t%s -> %-10s\t%s\t%s" %
+            (i.address,
+                hexbytes(i.bytes), i.mnemonic, i.op_str,
+                hexbytes(j.bytes), j.mnemonic, j.op_str))
+
+    cfs_table.append(new_cfs(CFS.pop_fp_pc, i.bytes, 0, 0))
+
+    start_address = lastAddress
+    end_address = i.address
+    # h = blake2s(digest_size = 4)
+    h = sha256()
+    current_address = start_address
+    mm.seek(start_address - load_address)
+    code = mm.read(mm.size() - mm.tell())
+    for ii in md.disasm(code, current_address):
+        if current_address >= end_address:
+            break
+        h.update(ii.bytes)
+        # logging.debug(binascii.hexlify(i.bytes))
+        current_address = current_address + 4
+    measurement = h.digest() 
+    # print measurement
+    logging.debug(binascii.hexlify(measurement)) 
+    logging.debug(int(binascii.hexlify(measurement), 16)) 
+    logging.debug(len(measurement)) 
+    logging.debug(hex(start_address))
+    logging.debug(hex(end_address)) 
+    
+    if len(i.operands) == 2 and i.operands[0].reg == ARM_REG_FP:
+        rt_type = 0
+    elif len(i.operands) == 3 and i.operands[0].reg == ARM_REG_R4 and i.operands[1].reg == ARM_REG_FP:
+        rt_type = 1
+    elif len(i.operands) == 4 and i.operands[0].reg == ARM_REG_R4 and i.operands[1].reg == ARM_REG_R5 and i.operands[2].reg == ARM_REG_FP:
+        rt_type = 2
+    elif len(i.operands) == 5 and i.operands[0].reg == ARM_REG_R4 and i.operands[2].reg == ARM_REG_R6 and i.operands[3].reg == ARM_REG_FP:
+        rt_type = 3
+    elif len(i.operands) == 6 and i.operands[0].reg == ARM_REG_R4 and i.operands[3].reg == ARM_REG_R7 and i.operands[4].reg == ARM_REG_FP:
+        rt_type = 4
+    elif len(i.operands) == 7 and i.operands[0].reg == ARM_REG_R4 and i.operands[4].reg == ARM_REG_R8 and i.operands[5].reg == ARM_REG_FP:
+        rt_type = 5
+    elif len(i.operands) == 8 and i.operands[0].reg == ARM_REG_R4 and i.operands[5].reg == ARM_REG_R9 and i.operands[6].reg == ARM_REG_FP:
+        rt_type = 6
+    elif len(i.operands) == 9 and i.operands[0].reg == ARM_REG_R4 and i.operands[6].reg == ARM_REG_R10 and i.operands[7].reg == ARM_REG_FP:
+        rt_type = 7
+    elif len(i.operands) == 10 and i.operands[0].reg == ARM_REG_R3 and i.operands[7].reg == ARM_REG_R10 and i.operands[8].reg == ARM_REG_FP:
+        rt_type = 8
+    elif len(i.operands) == 2 and i.operands[0].reg == ARM_REG_R4:
+        rt_type = 9
+    elif len(i.operands) == 3 and i.operands[0].reg == ARM_REG_R4 and i.operands[1].reg == ARM_REG_R5:
+        rt_type = 10
+    elif len(i.operands) == 4 and i.operands[0].reg == ARM_REG_R4 and i.operands[2].reg == ARM_REG_R6:
+        rt_type = 11
+    elif len(i.operands) == 5 and i.operands[0].reg == ARM_REG_R4 and i.operands[3].reg == ARM_REG_R7:
+        rt_type = 12
+    elif len(i.operands) == 6 and i.operands[0].reg == ARM_REG_R4 and i.operands[4].reg == ARM_REG_R8:
+        rt_type = 13
+    elif len(i.operands) == 7 and i.operands[0].reg == ARM_REG_R4 and i.operands[5].reg == ARM_REG_R9:
+        rt_type = 14
+    elif len(i.operands) == 8 and i.operands[0].reg == ARM_REG_R4 and i.operands[6].reg == ARM_REG_R10:
+        rt_type = 15
+    elif len(i.operands) == 9 and i.operands[0].reg == ARM_REG_R3 and i.operands[7].reg == ARM_REG_R10:
+        rt_type = 16
+    elif len(i.operands) == 1:
+        rt_type = 17
+    else:
+        rt_type = 200
+        
+    logging.debug(rt_type) 
+    function_table.append(new_function(start_address, end_address, int(binascii.hexlify(measurement), 16), rt_type))
+
+    if dry_run: return
+    write_back(mm, i.address - load_address, word, CFS.pop_fp_pc)
+
+#################################################################################
+
+def rewrite_pop_fp_lr(mm, cfs_table, load_address, i, target, dry_run=False):
+    word = new_branch_with_link_instruction(i, target)
+
+    j = disasm_single(word, i.address)
+
+    logging.info("pop   at 0x%08x: hooking %-10s\t%s\t%s -> %-10s\t%s\t%s" %
+            (i.address,
+                hexbytes(i.bytes), i.mnemonic, i.op_str,
+                hexbytes(j.bytes), j.mnemonic, j.op_str))
+
+    cfs_table.append(new_cfs(CFS.pop_fp_lr, i.bytes, 0, 0))
+
+    if dry_run: return
+    write_back(mm, i.address - load_address, word, CFS.pop_fp_lr)
+
+
+def rewrite_blx_rx(mm, cfs_table, load_address, i, target, dry_run=False):
+    word = new_branch_with_link_instruction(i, target)
+
+    j = disasm_single(word, i.address)
+
+    logging.info("blx rx at 0x%08x: hooking %-10s\t%s\t%s -> %-10s\t%s\t%s" %
+            (i.address,
+                hexbytes(i.bytes), i.mnemonic, i.op_str,
+                hexbytes(j.bytes), j.mnemonic, j.op_str))
+
+    if i.operands[0].reg == ARM_REG_R3:
+        rt_type = 0
+    elif i.operands[0].reg == ARM_REG_R4:
+        rt_type = 1
+    elif i.operands[0].reg == ARM_REG_R5:
+        rt_type = 2
+    elif i.operands[0].reg == ARM_REG_R6:
+        rt_type = 3
+    elif i.operands[0].reg == ARM_REG_R7:
+        rt_type = 4
+    elif i.operands[0].reg == ARM_REG_R8:
+        rt_type = 5
+    elif i.operands[0].reg == ARM_REG_R9:
+        rt_type = 6
+    elif i.operands[0].reg == ARM_REG_R10:
+        rt_type = 7
+    elif i.operands[0].reg == ARM_REG_R2:
+        rt_type = 8
+    elif i.operands[0].reg == ARM_REG_R11:
+        rt_type = 9
+    elif i.operands[0].reg == ARM_REG_R12:
+        rt_type = 10
+    else:
+        rt_type = 200
+
+    cfs_table.append(new_cfs_with_lr(CFS.blx, i.bytes, i.address, 0, 0, rt_type))
+
+    if dry_run: return
+    write_back(mm, i.address - load_address, word, CFS.blx)
+
+
+def hexbytes(insn):
+    width = int(pow(2, math.ceil(math.log(len(insn))/math.log(2))))
+    return "0x" + binascii.hexlify(bytearray(insn)).zfill(width)
+
+def get_current_pc(i):
+    return i.address + 4
+
+def get_target_offset(current_pc, target):
+    return (target - current_pc)  / 4 - 1  # pc relative offset of target
+
+def get_target_address(current_pc, offset):
+    return (offset * 4) + current_pc + 4  # absolute address of pc relative offset
+
+def long_to_bytes(value, width=8, endian='big'):
+    #print(('%%0%dx' % (width)) % ((value + (1 << width*4)) % (1 << width*4)))
+    s = binascii.unhexlify(('%%0%dx' % (width)) % ((value + (1 << width*4)) % (1 << width*4)))
+    return s[::-1] if endian == 'little' else s
+
+def bytes_to_long(data, endian='big'):
+    data = data[::-1] if endian == 'little' else data
+
+    if data[0] & 0x80 > 0:
+        return -bytes_to_long(bytearray(~d % 256 for d in data)) - 1
+
+    return int(str(data).encode('hex'), 16)
+
+def disasm_single(word, address):
+    md = Cs(CS_ARCH_ARM, CS_MODE_ARM)
+
+    for i in md.disasm(str(word), address):
+        return i
+
+def write_back(mm, addr, word, type):
+    # if(type == CFS.b or type == CFS.pop_fp_lr or type == CFS.pop_fp_pc):
+    #     origsize = mm.size()
+    #     mm.resize(origsize + 1)
+    #     mm[addr+1:] = mm[addr:origsize]
+    #     mm.seek(addr)
+    #     mm.write(str(word))
+    # else:
+    mm.seek(addr)
+    mm.write(str(word))
+
+def get_branch_target(i):
+    b = bitarray(endian="big")
+    b.frombytes(str(i.bytes))
+
+    return get_target_address(get_current_pc(i), bytes_to_long(bytearray(b[0:24].tobytes()), endian='little'))
+
+def new_branch_with_link_instruction(i, target):
+    bits = bitarray('0'*32, endian='big')
+
+    bits[28:32] = bitarray('1011')  # opcode for BL
+    bits[24:28] = cond_bits(i)      # condition bits from original instruction
+    bits[00:24] = bytes_to_bits(long_to_bytes(
+        get_target_offset(get_current_pc(i), target),
+        width=6, endian='little'))
+
+    return bytearray(bits.tobytes())
+
+def cond_bits(i):
+    bits = bitarray(endian='big')
+    bits.frombytes(str(i.bytes))
+    return bits[24:28]
+
+def bytes_to_bits(data_bytes):
+    bits = bitarray(endian='big')
+    bits.frombytes(str(data_bytes))
+    return bits
+
+def write_branch_table(pathname, branches):
+    with open(pathname, "w") as f:
+        f.write("/* Automatically generated by %s on %s, do not edit! */\n\n" % (sys.argv[0], datetime.today()))
+        f.write("#include \"ripte_helpers.h\"\n\n")
+        f.write("__attribute__((section(\".btbl\"),unused)) struct btbl_entry btbl[] = {\n")
+        # static
+        for b in branches:
+            f.write("\t{0x%08x,0x%08x},\n" % (b.src, b.dst))
+
+        f.write("};\n")
+        f.write("int len_btbl = %d;\n" % len(branches));#sizeof(btbl)/sizeof(struct btbl_entry);\n")
+
+def write_loop_table(pathname, loops):
+    with open(pathname, "w") as f:
+        f.write("/* Automatically generated by %s on %s, do not edit! */\n\n" % (sys.argv[0], datetime.today()))
+        f.write("#include \"ripte_helpers.h\"\n\n")
+        f.write("__attribute__((section(\".ltbl\"),unused)) struct ltbl_entry ltbl[] = {\n")
+        # static
+        for (entry, exit) in loops:
+            f.write("\t{0x%08x,0x%08x},\n" % (entry, exit))
+
+        f.write("};\n")
+        f.write("int len_ltbl = %d;\n" % len(loops));#sizeof(ltbl)/sizeof(struct ltbl_entry);\n")
+
+def write_function_call_table(pathname, functions):
+    with open(pathname, "w") as f:
+        f.write("/* Automatically generated by %s on %s, do not edit! */\n\n" % (sys.argv[0], datetime.today()))
+        f.write("#include \"ripte_helpers.h\"\n\n")
+        f.write("__attribute__((section(\".ftbl\"),unused)) struct ftbl_entry ftbl[] = {\n")
+        # static
+        for b in functions:
+            # print len(b.lr_value)
+            f.write("\t{0x%08x,0x%08x" % (b.src, b.dst))
+            if isinstance(b.lr_value, int):
+                f.write(",{0x00")
+                for x in xrange(1,64):
+                    f.write(",0x00")
+            else:
+                f.write(",{0x%s" % b.lr_value[0:2])
+                for x in xrange(1,64):
+                    if 2*x < len(b.lr_value):
+                        f.write(",0x%s" % b.lr_value[2*x:2*x+2])
+                    else:
+                        f.write(",0x00")
+            f.write("}, %d},\n" % b.rt_type) 
+        f.write("};\n")
+        f.write("int len_ftbl = %d;\n" % len(functions));#sizeof(btbl)/sizeof(struct btbl_entry);\n")
+
+def write_function_table(pathname, functions):
+    with open(pathname, "w") as f:
+        f.write("/* Automatically generated by %s on %s, do not edit! */\n\n" % (sys.argv[0], datetime.today()))
+        f.write("#include \"ripte_helpers.h\"\n\n")
+        f.write("__attribute__((section(\".fdtbl\"),unused)) struct fdtbl_entry fdtbl[] = {\n")
+        # static
+        for b in functions:
+            # print len(b.lr_value)
+            f.write("\t{0x%08x,0x%08x" % (b.start, b.end))
+            measurement = hex(b.measurement)[2:-1]
+            measurement = "0" * (64-len(measurement)) + measurement
+            f.write(",{0x%s" % measurement[0:2])
+            for x in xrange(1,32):
+                f.write(",0x%s" % measurement[2*x:2*x+2])
+            f.write("}, %d},\n" % b.rt_type) 
+
+        f.write("};\n")
+        f.write("int len_fdtbl = %d;\n" % len(functions));#sizeof(btbl)/sizeof(struct btbl_entry);\n")
+
+
+if __name__ == "__main__":
+    main()
